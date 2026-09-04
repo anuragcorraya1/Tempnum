@@ -26,7 +26,6 @@ from telegram import (
     KeyboardButton,
     BotCommand,
     MenuButtonCommands,
-    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -69,12 +68,11 @@ POLL_INTERVAL = 5    # seconds
 MAX_WAIT      = 300  # 5 minutes
 
 # ─── Global State ─────────────────────────────────────────────────────────────
-# user_id → { "number", "idx", "source", "task", "seen", "latest_sms" }
 active: dict[int, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PERSISTENT BOTTOM MENU  (Reply Keyboard — সবসময় নিচে থাকে)
+#  PERSISTENT BOTTOM MENU  (persistent=True সরিয়ে দেওয়া হয়েছে এরর দূর করতে)
 # ══════════════════════════════════════════════════════════════════════════════
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -84,7 +82,6 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton("💰 Balance Info"), KeyboardButton("❓ Help")],
     ],
     resize_keyboard=True,
-    persistent=True,
     input_field_placeholder="👇 নিচের menu থেকে বেছে নিন...",
 )
 
@@ -149,10 +146,8 @@ def scrape_inbox(idx: int) -> list[dict]:
         return []
 
     messages = []
-    # Every code block has pattern: `Code: XXXX`
     for code_tag in soup.find_all(string=re.compile(r"Code:\s*\d+")):
         parent = code_tag.parent
-        # Walk up 6 levels to capture the full message block
         block = parent
         for _ in range(6):
             if block is None:
@@ -164,25 +159,20 @@ def scrape_inbox(idx: int) -> list[dict]:
 
         full = block.get_text(" ", strip=True)
 
-        # Extract OTP code
         code_m = re.search(r"Code:\s*(\d+)", full)
         code   = code_m.group(1) if code_m else ""
 
-        # Extract time ago
         time_m = re.search(
             r"(just now|\d+\s*(?:min|sec|hour|second|minute)s?\s*ago|recently)",
             full, re.IGNORECASE
         )
         time_s = time_m.group(0) if time_m else "recently"
-
-        # Sender detection
         sender = _sender(full)
 
-        # Clean message text
         clean = re.sub(r"`Code:\s*\d+`", "", full)
         clean = re.sub(r"\s{2,}", " ", clean).strip()[:350]
 
-        if code:  # Only include SMS that have a code
+        if code:
             messages.append({
                 "sender": sender,
                 "time":   time_s,
@@ -190,17 +180,14 @@ def scrape_inbox(idx: int) -> list[dict]:
                 "code":   code,
             })
 
-    # Also catch SMS without explicit "Code:" label
     for block in soup.select("div, article, li"):
         text = block.get_text(" ", strip=True)
         if len(text) < 15 or len(text) > 500:
             continue
-        # Look for 4-8 digit standalone OTP pattern
         otp_m = re.search(r"\b(\d{4,8})\b", text)
         if not otp_m:
             continue
         code = otp_m.group(1)
-        # Skip if already captured
         if any(m["code"] == code for m in messages):
             continue
         time_m = re.search(
@@ -214,7 +201,6 @@ def scrape_inbox(idx: int) -> list[dict]:
             "code":   code,
         })
 
-    # Deduplicate by code
     seen = set()
     unique = []
     for m in messages:
@@ -268,19 +254,14 @@ def otp_inline_kb(code: str, idx: int, number: str) -> InlineKeyboardMarkup:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  REAL-TIME POLLING  (background task)
+#  REAL-TIME POLLING
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def realtime_poll(user_id: int, idx: int, number: str,
                         context: ContextTypes.DEFAULT_TYPE):
-    """
-    Polls the inbox every POLL_INTERVAL seconds.
-    Sends new OTP messages to the user immediately.
-    """
     elapsed  = 0
     seen_set: set[str] = set()
 
-    # Pre-load existing messages (don't re-notify old ones)
     for m in scrape_inbox(idx):
         seen_set.add(m["code"])
 
@@ -313,7 +294,6 @@ async def realtime_poll(user_id: int, idx: int, number: str,
             text   = msg["text"]
             time_s = msg["time"]
 
-            # Store latest SMS in state
             active[user_id]["latest_sms"] = msg
 
             notification = (
@@ -335,7 +315,6 @@ async def realtime_poll(user_id: int, idx: int, number: str,
             except Exception as e:
                 logger.error("poll send err: %s", e)
 
-    # Timeout
     active.pop(user_id, None)
     try:
         await context.bot.send_message(
@@ -353,22 +332,18 @@ async def realtime_poll(user_id: int, idx: int, number: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CORE LOGIC: get a number & start monitoring
+#  CORE LOGIC
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def give_new_number(user_id: int, chat_id: int,
                           context: ContextTypes.DEFAULT_TYPE,
                           reply_fn):
-    """Pick a random active BD number and start real-time polling."""
-
-    # Cancel existing task
     if user_id in active:
         t = active[user_id].get("task")
         if t and not t.done():
             t.cancel()
         active.pop(user_id)
 
-    # Scrape number list in thread
     loop    = asyncio.get_event_loop()
     numbers = await loop.run_in_executor(None, scrape_number_list)
 
@@ -379,12 +354,10 @@ async def give_new_number(user_id: int, chat_id: int,
         )
         return
 
-    # Pick a random active number
     chosen = random.choice(active_nums)
     idx    = chosen["idx"]
     number = chosen["number"]
 
-    # Save state
     active[user_id] = {
         "idx": idx, "number": number,
         "source": "main", "seen": set(),
@@ -405,7 +378,6 @@ async def give_new_number(user_id: int, chat_id: int,
     )
     await reply_fn(msg, keyboard=number_inline_kb(number, idx))
 
-    # Start real-time polling
     task = asyncio.create_task(realtime_poll(user_id, idx, number, context))
     active[user_id]["task"] = task
 
@@ -472,14 +444,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MENU BUTTON HANDLERS  (Reply Keyboard text messages)
+#  MENU BUTTON HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text    = update.message.text.strip()
     user_id = update.effective_user.id
 
-    # ── 📞 New Number ─────────────────────────────────────────────────────────
     if "New Number" in text:
         loading = await update.message.reply_text(
             "⏳ বাংলাদেশি নম্বর খোঁজা হচ্ছে...",
@@ -495,7 +466,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await give_new_number(user_id, update.effective_chat.id, context, reply_fn)
 
-    # ── 👁 View OTP ──────────────────────────────────────────────────────────
     elif "View OTP" in text:
         if user_id not in active:
             await update.message.reply_text(
@@ -531,7 +501,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=otp_inline_kb(code, idx, number),
             )
         else:
-            # Fetch live from the page
             loading = await update.message.reply_text(
                 "🔄 Real-time OTP চেক করা হচ্ছে...",
                 reply_markup=MAIN_MENU,
@@ -564,7 +533,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=MAIN_MENU,
                 )
 
-    # ── 📋 Copy Number ────────────────────────────────────────────────────────
     elif "Copy Number" in text:
         if user_id not in active:
             await update.message.reply_text(
@@ -581,7 +549,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MAIN_MENU,
         )
 
-    # ── ❌ Stop ────────────────────────────────────────────────────────────────
     elif "Stop" in text:
         if user_id not in active:
             await update.message.reply_text(
@@ -602,7 +569,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MAIN_MENU,
         )
 
-    # ── 💰 Balance Info ───────────────────────────────────────────────────────
     elif "Balance" in text:
         user_info = active.get(user_id, {})
         number    = user_info.get("number", "—")
@@ -622,7 +588,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_MENU
         )
 
-    # ── ❓ Help ────────────────────────────────────────────────────────────────
     elif "Help" in text:
         await cmd_help(update, context)
 
@@ -637,7 +602,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
     user_id = query.from_user.id
 
-    # ── Copy number ──────────────────────────────────────────────────────────
     if data.startswith("copynum:"):
         number = data.split(":", 1)[1]
         await query.message.reply_text(
@@ -647,7 +611,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MAIN_MENU,
         )
 
-    # ── Copy OTP ─────────────────────────────────────────────────────────────
     elif data.startswith("copyotp:"):
         code = data.split(":", 1)[1]
         await query.message.reply_text(
@@ -657,7 +620,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MAIN_MENU,
         )
 
-    # ── View OTP inline ───────────────────────────────────────────────────────
     elif data.startswith("viewotp:"):
         parts  = data.split(":", 2)
         idx    = int(parts[1])
@@ -691,7 +653,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=MAIN_MENU,
             )
 
-    # ── New number ────────────────────────────────────────────────────────────
     elif data == "newnum":
         loading = await query.message.reply_text(
             "⏳ নতুন নম্বর খোঁজা হচ্ছে..."
@@ -706,7 +667,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id, query.message.chat_id, context, reply_fn
         )
 
-    # ── Stop ──────────────────────────────────────────────────────────────────
     elif data == "stop":
         if user_id in active:
             info = active.pop(user_id)
@@ -755,17 +715,14 @@ def main():
         .build()
     )
 
-    # Slash command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
 
-    # Reply keyboard (bottom menu bar) handler
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         handle_menu,
     ))
 
-    # Inline button handler
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     logger.info("🤖 Bot চালু হচ্ছে...")
